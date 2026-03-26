@@ -1,0 +1,24 @@
+# Core Web Framework
+Flask
+gunicorn
+werkzeug
+Jinja2
+
+# AI & Voice Services
+groq
+openai
+edge-tts
+
+# Database & Auth
+supabase
+
+# Utilities & Config
+python-dotenv
+httpx
+
+# Document Processing / Generation
+python-docx
+PyPDF2
+xhtml2pdf
+markdown
+
