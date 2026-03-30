@@ -514,7 +514,10 @@ def admin_delete_chat(user_key, session_id):
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
-
+      
+@app.route("/health")
+def health():
+    return "OK", 200
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
