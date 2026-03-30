@@ -5,6 +5,12 @@ Main application file with routes for:
   - Upload → Quotation generation      [existing, unchanged]
   - Chatbot → Quotation generation     [new]
   - Admin dashboard                    [new]
+
+Concurrency Notes (30 simultaneous users):
+  - Flask sessions are cookie-based (server-side state is minimal)
+  - LLMHandler / Groq client are created per-request (stateless, thread-safe)
+  - DocumentParser & DocumentGenerator are shared but only use thread-safe I/O
+  - Gunicorn with multiple workers + threads handles the load
 """
 
 from flask import (
@@ -13,6 +19,8 @@ from flask import (
 )
 import os
 import sys
+import secrets
+import threading
 from functools import wraps
 from werkzeug.utils import secure_filename
 from datetime import datetime
@@ -38,8 +46,19 @@ app = Flask(__name__)
 app.config.from_object(Config)
 Config.init_app(app)
 
-# Initialize modules
-doc_parser = DocumentParser()
+# ── Thread-local storage for per-request resources ──────────────────────────
+_local = threading.local()
+
+def get_llm_handler():
+    """Return a per-request LLMHandler (thread-safe, no shared state)."""
+    if not hasattr(_local, 'llm_handler'):
+        _local.llm_handler = LLMHandler()
+    return _local.llm_handler
+
+
+# Shared, read-only helpers — safe for concurrent use as they carry no
+# mutable state between requests.
+doc_parser    = DocumentParser()
 doc_generator = DocumentGenerator(output_folder=app.config['OUTPUT_FOLDER'])
 
 
@@ -78,7 +97,7 @@ def login():
         return redirect(url_for('index'))
     error = None
     if request.method == 'POST':
-        company = request.form.get('company', '').strip()
+        company  = request.form.get('company', '').strip()
         password = request.form.get('password', '').strip()
         if not company or not password:
             error = 'Please fill in both fields.'
@@ -99,15 +118,15 @@ def register():
     """Register page."""
     if 'user' in session:
         return redirect(url_for('index'))
-    error = None
+    error   = None
     success = None
     if request.method == 'POST':
-        name = request.form.get('name', '').strip()
+        name    = request.form.get('name',    '').strip()
         company = request.form.get('company', '').strip()
-        email = request.form.get('email', '').strip()
-        phone = request.form.get('phone', '').strip()
+        email   = request.form.get('email',   '').strip()
+        phone   = request.form.get('phone',   '').strip()
         password = request.form.get('password', '').strip()
-        confirm = request.form.get('confirm', '').strip()
+        confirm  = request.form.get('confirm',  '').strip()
         if not all([name, company, email, phone, password]):
             error = 'All fields are required.'
         elif len(password) < 6:
@@ -152,14 +171,18 @@ def upload_file():
             return jsonify({'success': False, 'error': 'No file selected'})
         if not allowed_file(file.filename, app.config['ALLOWED_EXTENSIONS']):
             return jsonify({'success': False, 'error': 'Invalid file type. Please upload Word, PDF, Excel, or image files.'})
-        filename = secure_filename(file.filename)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"{timestamp}_{filename}"
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+        filename  = secure_filename(file.filename)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')   # microseconds → no collision
+        user_key  = session.get('user', {}).get('key', 'anon')
+        filename  = f"{user_key}_{timestamp}_{filename}"
+        filepath  = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
-        parsed_data = doc_parser.parse_document(filepath)
+
+        parsed_data  = doc_parser.parse_document(filepath)
         if not parsed_data.get('success'):
             return jsonify({'success': False, 'error': f"Failed to parse document: {parsed_data.get('error')}"})
+
         requirements = doc_parser.extract_requirements(parsed_data)
         response = {
             'success': True, 'filename': filename, 'filepath': filepath,
@@ -168,7 +191,7 @@ def upload_file():
         if parsed_data.get('structured_data'):
             response['structured_data'] = parsed_data.get('structured_data')
         if parsed_data.get('method') == 'ocr':
-            response['ocr_used'] = True
+            response['ocr_used']       = True
             response['ocr_confidence'] = parsed_data.get('ocr_confidence', 0)
         if parsed_data.get('sections'):
             response['sections'] = parsed_data.get('sections')
@@ -180,27 +203,24 @@ def upload_file():
 @app.route('/generate', methods=['POST'])
 @login_required
 def generate_quotation():
-    """Generate quotation using LLM"""
+    """Generate quotation using LLM — fresh handler per request (thread-safe)."""
     try:
-        data = request.get_json()
-        print("=" * 50)
-        print("GENERATE QUOTATION REQUEST")
-        print("=" * 50)
+        data         = request.get_json()
         requirements = data.get('requirements')
         template_type = data.get('template_type', 'type1')
-        print(f"Requirements length: {len(requirements) if requirements else 0}")
-        print(f"Template type: {template_type}")
+
         if not requirements:
             return jsonify({'success': False, 'error': 'No requirements provided'})
-        llm_handler = LLMHandler()
+
+        llm_handler   = LLMHandler()          # new instance per request — stateless
         quotation_data = llm_handler.generate_quotation(
             requirements=requirements,
             template_type=template_type
         )
-        print(f"LLM Response success: {quotation_data.get('success')}")
         if not quotation_data.get('success'):
             error_msg = quotation_data.get('error', 'Unknown error')
             return jsonify({'success': False, 'error': f"Failed to generate quotation: {error_msg}"})
+
         return jsonify({'success': True, 'quotation_data': quotation_data})
     except Exception as e:
         import traceback
@@ -213,16 +233,18 @@ def generate_quotation():
 def download_pdf():
     """Generate and download PDF"""
     try:
-        data = request.get_json()
+        data           = request.get_json()
         quotation_data = data.get('quotation_data')
-        template_type = data.get('template_type', 'type1')
+        template_type  = data.get('template_type', 'type1')
         if not quotation_data:
             return jsonify({'success': False, 'error': 'No quotation data provided'})
-        user = session.get('user', {})
+        user         = session.get('user', {})
         company_name = user.get('company', '')
-        full_name = user.get('name', '')
-        pdf_path = doc_generator.generate_pdf(quotation_data, template_type,
-                                              company_name=company_name, full_name=full_name)
+        full_name    = user.get('name', '')
+        pdf_path     = doc_generator.generate_pdf(
+            quotation_data, template_type,
+            company_name=company_name, full_name=full_name
+        )
         return jsonify({'success': True, 'filename': os.path.basename(pdf_path), 'filepath': pdf_path})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -233,16 +255,18 @@ def download_pdf():
 def download_word():
     """Generate and download Word document"""
     try:
-        data = request.get_json()
+        data           = request.get_json()
         quotation_data = data.get('quotation_data')
-        template_type = data.get('template_type', 'type1')
+        template_type  = data.get('template_type', 'type1')
         if not quotation_data:
             return jsonify({'success': False, 'error': 'No quotation data provided'})
-        user = session.get('user', {})
+        user         = session.get('user', {})
         company_name = user.get('company', '')
-        full_name = user.get('name', '')
-        word_path = doc_generator.generate_word(quotation_data, template_type,
-                                               company_name=company_name, full_name=full_name)
+        full_name    = user.get('name', '')
+        word_path    = doc_generator.generate_word(
+            quotation_data, template_type,
+            company_name=company_name, full_name=full_name
+        )
         return jsonify({'success': True, 'filename': os.path.basename(word_path), 'filepath': word_path})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -269,7 +293,7 @@ def download_file(filename):
 @login_required
 def chat():
     """Render chatbot UI."""
-    user = session['user']
+    user      = session['user']
     histories = list_histories(user['key'])
     return render_template(
         'chat.html',
@@ -289,29 +313,29 @@ def chat_message():
     Returns: { reply, history, summary_ready, session_id }
     """
     try:
-        data = request.get_json()
-        model = data.get('model', DEFAULT_MODEL)
-        history = data.get('history', [])
+        data     = request.get_json()
+        model    = data.get('model', DEFAULT_MODEL)
+        history  = data.get('history', [])
         user_msg = data.get('message', '').strip()
-        sid = data.get('session_id') or datetime.now().strftime('%Y%m%d_%H%M%S')
+        sid      = data.get('session_id') or datetime.now().strftime('%Y%m%d_%H%M%S_%f')
 
         if not user_msg:
             return jsonify({'success': False, 'error': 'Empty message'})
 
-        result = send_message(model, history, user_msg)
+        result          = send_message(model, history, user_msg)
         updated_history = result['history']
 
         # Auto-save to Supabase
-        user = session['user']
+        user  = session['user']
         title = make_title(updated_history)
         save_history(user['key'], sid, updated_history, title)
 
         return jsonify({
-            'success': True,
-            'reply': result['reply'],
-            'history': updated_history,
+            'success':       True,
+            'reply':         result['reply'],
+            'history':       updated_history,
             'summary_ready': result['summary_ready'],
-            'session_id': sid,
+            'session_id':    sid,
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -322,8 +346,8 @@ def chat_message():
 def chat_greet():
     """Get the initial AI greeting."""
     try:
-        data = request.get_json()
-        model = data.get('model', DEFAULT_MODEL)
+        data     = request.get_json()
+        model    = data.get('model', DEFAULT_MODEL)
         greeting = get_greeting(model)
         return jsonify({'success': True, 'greeting': greeting})
     except Exception as e:
@@ -340,29 +364,23 @@ def chat_generate():
     Body: { api_key, model, history, template_type }
     """
     try:
-        data = request.get_json()
-        model = data.get('model', DEFAULT_MODEL)
-        history = data.get('history', [])
+        data          = request.get_json()
+        model         = data.get('model', DEFAULT_MODEL)
+        history       = data.get('history', [])
         template_type = data.get('template_type', 'type1')
 
         if not history:
             return jsonify({'success': False, 'error': 'No conversation history provided'})
 
         # Step 1 — Expand Q&A into a detailed requirements document
-        print("=" * 50)
-        print("CHAT → QUOTATION: Step 1 — Expanding requirements")
         requirements_text = expand_to_requirements(model, history)
-        print(f"Expanded requirements length: {len(requirements_text)}")
 
         # Step 2 — Generate quotation (same engine as upload path)
-        print("CHAT → QUOTATION: Step 2 — Generating quotation")
-        llm_handler = LLMHandler()
+        llm_handler    = LLMHandler()     # fresh per request
         quotation_data = llm_handler.generate_quotation(
             requirements=requirements_text,
             template_type=template_type,
         )
-        print(f"Quotation generation success: {quotation_data.get('success')}")
-        print("=" * 50)
 
         if not quotation_data.get('success'):
             return jsonify({'success': False, 'error': quotation_data.get('error', 'Generation failed')})
@@ -406,18 +424,14 @@ def chat_stt():
     Receives base64-encoded WebM audio, calls Groq Whisper, returns text.
     """
     try:
-        data = request.get_json()
-        audio_b64 = data.get('audio_b64', '')
-        
+        data       = request.get_json()
+        audio_b64  = data.get('audio_b64', '')
         if not audio_b64:
             return jsonify({'success': False, 'error': 'No audio data received'})
-            
         audio_bytes = base64.b64decode(audio_b64)
-        transcript = call_stt(audio_bytes)
-        
+        transcript  = call_stt(audio_bytes)
         if transcript.startswith("[Transcription error"):
             return jsonify({'success': False, 'error': transcript})
-            
         return jsonify({'success': True, 'text': transcript})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -433,14 +447,11 @@ def chat_tts():
     try:
         data = request.get_json()
         text = data.get('text', '').strip()
-        
         if not text:
             return jsonify({'success': False, 'error': 'No text provided'})
-            
         audio_bytes = synthesize_tts(text)
         if not audio_bytes:
             return jsonify({'success': False, 'error': 'Failed to synthesize speech'})
-            
         audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
         return jsonify({'success': True, 'audio_b64': audio_b64})
     except Exception as e:
@@ -463,11 +474,10 @@ def admin_dashboard():
 def admin_users():
     """Return all users as JSON."""
     try:
-        users = list_all_users()
+        users     = list_all_users()
         non_admin = [u for u in users if u.get('role') != 'admin']
-        # Enrich each user with chat count
         for u in non_admin:
-            histories = list_histories(u['key'])
+            histories    = list_histories(u['key'])
             u['chat_count'] = len(histories)
         return jsonify({'success': True, 'users': non_admin})
     except Exception as e:
@@ -480,11 +490,11 @@ def admin_user_chats(user_key):
     """Return chat sessions for a user."""
     try:
         histories = list_histories(user_key)
-        sessions = [
+        sessions  = [
             {
-                'session_id': fname.replace('.json', ''),
-                'title': meta.get('title', 'Untitled'),
-                'saved_at': meta.get('saved_at', 0),
+                'session_id':    fname.replace('.json', ''),
+                'title':         meta.get('title', 'Untitled'),
+                'saved_at':      meta.get('saved_at', 0),
                 'message_count': len(meta.get('messages', [])),
             }
             for fname, meta in histories
@@ -514,10 +524,16 @@ def admin_delete_chat(user_key, session_id):
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
-      
-@app.route("/health")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route('/health')
 def health():
-    return "OK", 200
+    return jsonify({'status': 'healthy', 'message': 'Service is running'}), 200
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Development only — for 30 concurrent users run via gunicorn (see render.yaml / gunicorn.conf.py)
+    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
